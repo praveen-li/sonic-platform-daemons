@@ -1,0 +1,176 @@
+#!/usr/bin/env python
+
+"""
+    ssdd
+    Ssd information gathering daemon for SONiC
+    This daemon will be started during the start phase of pmon container, gathering SSD info and write to state DB.
+    It will continue monitoring the state DB for the ssd table, if table was deleted, it will write again.
+    With this daemon, show ssd CLI will be able to get data from state DB instead of access hw or cache.
+"""
+
+try:
+    import os
+    import imp
+    import string
+    import sys
+    import syslog
+    import signal
+    import subprocess
+    import threading
+    import time
+
+    from swsscommon import swsscommon
+    from sonic_platform_base.sonic_ssd.ssd_generic import SsdUtil
+except ImportError as e:
+    raise ImportError(str(e) + " - required module not found")
+
+#
+# Constants ====================================================================
+#
+
+# periodically check SSD every 60 minutes
+SSD_INFO_UPDATE_PERIOD_SECS = 3600
+
+POST_SSD_SUCCESS = 0
+ERR_SSDUTIL_LOAD = 2
+
+REDIS_HOSTNAME = "localhost"
+REDIS_PORT = 6379
+REDIS_TIMEOUT_MSECS = 0
+
+SSD_INFO_TABLE = 'SSD_INFO'
+SSD_DEV_NAME = "sda"
+SSD_TBL_KEY = SSD_INFO_TABLE+'|'+SSD_DEV_NAME
+
+SYSLOG_IDENTIFIER = 'ssdd'
+
+DEFAULT_DEVICE="/dev/sda"
+
+# Thread wrapper class to update SSD info periodically
+
+class DaemonSsd():
+    def __init__(self, log_identifier):
+	self.task_thread = None
+	self.task_stopping_event = threading.Event()
+	self.ssd = None
+	self._db = None
+	self.ssd_info = None
+	self.ssd_info_dict = {}
+        self.ssd =  SsdUtil(DEFAULT_DEVICE)
+
+        # Connect to STATE_DB and create SSD, syslog and process info tables
+        self._db = swsscommon.DBConnector(swsscommon.STATE_DB,
+                                          REDIS_HOSTNAME,
+                                          REDIS_PORT,
+                                          REDIS_TIMEOUT_MSECS)
+        self._table = swsscommon.Table(self._db, SSD_INFO_TABLE)
+
+    # Syslog wrappers
+    def log_info(self, msg):
+       syslog.openlog(SYSLOG_IDENTIFIER)
+       syslog.syslog(syslog.LOG_INFO, msg)
+       syslog.closelog()
+
+    def log_warning(self, msg):
+        syslog.openlog(SYSLOG_IDENTIFIER)
+        syslog.syslog(syslog.LOG_WARNING, msg)
+        syslog.closelog()
+
+    def log_error(self, msg):
+       syslog.openlog(SYSLOG_IDENTIFIER)
+       syslog.syslog(syslog.LOG_ERR, msg)
+       syslog.closelog()
+
+    # Signal handler
+    def signal_handler(self, sig, frame):
+        if sig == signal.SIGHUP:
+            self.log_info("Caught SIGHUP - ignoring...")
+            return
+        elif sig == signal.SIGINT:
+            self.log_info("Caught SIGINT - exiting...")
+            sys.exit(128 + sig)
+        elif sig == signal.SIGTERM:
+            self.log_info("Caught SIGTERM - exiting...")
+            sys.exit(128 + sig)
+        else:
+            self.log_warning("Caught unhandled signal '" + sig + "'")
+
+    # Run daemon
+    def run(self):
+        self.log_info("Start SSD info loop")
+
+	# Start loop to update SSD info in DB periodically
+	while True:
+            # Connect to STATE_DB and post syseeprom info to state DB
+            ssd_info_dict = self.process_data()
+
+            # run smart command to get SSD info
+            if ssd_info_dict is not None:
+                # write SSD info to SSD_INFO table in redis
+                self.post_ssd_info_to_db(ssd_info_dict)
+
+            self.task_stopping_event.wait(SSD_INFO_UPDATE_PERIOD_SECS)
+
+	# clear the information from DB
+        self._table._del(SSD_TBL_KEY)
+        self._db.close(self._db.STATE_DB)
+        self.log_info("Stop SSD info update loop")
+
+    def parse_generic_ssd_info(self):
+	ssd = self.ssd
+	ssd_info_dict = {}
+
+	# parse output
+	ssd_info_dict['health'] = ssd.get_health()
+	ssd_info_dict['modelnum'] = ssd.get_model()
+	ssd_info_dict['serialnum'] = ssd.get_serial()
+	ssd_info_dict['firmware'] = ssd.get_firmware()
+	ssd_info_dict['temperature'] = ssd.get_temperature()
+	ssd_info_dict['power_on_hours'] = ssd.get_power_on_hours()
+	ssd_info_dict['power_cycle_count'] = ssd.get_power_cycle_count()
+	ssd_info_dict['bad_block_count'] = ssd.get_total_bad_block_count()
+	ssd_info_dict['erase_count_max'] = ssd.get_erase_count_max()
+	ssd_info_dict['erase_count_avg'] = ssd.get_erase_count_avg()
+
+	return ssd_info_dict
+
+    def process_data(self):
+        ssd_updated_list = []
+	ssd_dict_new = self.parse_generic_ssd_info()
+
+	# add data to the list to be post to db
+	for key, value in sorted(ssd_dict_new.items()):
+	    ssd_updated_list.append((key, value))
+
+	return ssd_updated_list
+
+    def post_ssd_info_to_db(self, ssd_info_list):
+	ssd_name = SSD_DEV_NAME
+
+	# write to SSD table
+	self.log_info("writing SSD info: {} to redis table: {}".format(ssd_info_list, SSD_INFO_TABLE))
+
+	# write SSD info
+	fvs = swsscommon.FieldValuePairs(ssd_info_list)
+	self._table.set(ssd_name, fvs)
+
+	return POST_SSD_SUCCESS
+
+#
+# Main =========================================================================
+#
+
+
+def main():
+    ssdd = DaemonSsd(SYSLOG_IDENTIFIER)
+
+    # Register our signal handlers
+    signal.signal(signal.SIGHUP, ssdd.signal_handler)
+    signal.signal(signal.SIGINT, ssdd.signal_handler)
+    signal.signal(signal.SIGTERM, ssdd.signal_handler)
+
+    ssdd.run()
+
+
+if __name__ == '__main__':
+    main()
