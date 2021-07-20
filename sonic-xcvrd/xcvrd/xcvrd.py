@@ -39,6 +39,12 @@ TRANSCEIVER_STATUS_TABLE = 'TRANSCEIVER_STATUS'
 
 SELECT_TIMEOUT_MSECS = 1000
 
+# Mgminit time required as per CMIS spec
+MGMT_INIT_TIME_DELAY_SECS = 2
+
+# SFP insert event poll duration
+SFP_INSERT_EVENT_POLL_PERIOD_MSECS = 1000
+
 DOM_INFO_UPDATE_PERIOD_SECS = 60
 TIME_FOR_SFP_READY_SECS = 1
 XCVRD_MAIN_THREAD_SLEEP_SECS = 60
@@ -183,6 +189,20 @@ def _wrapper_get_transceiver_dom_threshold_info(physical_port):
             pass
     return platform_sfputil.get_transceiver_dom_threshold_info_dict(physical_port)
 
+# Soak SFP insert event until management init completes
+def _wrapper_soak_sfp_insert_event(sfp_insert_events, port_dict):
+    for key, value in list(port_dict.items()):
+        if value == SFP_STATUS_INSERTED:
+            sfp_insert_events[key] = time.time()
+            del port_dict[key]
+        elif value == SFP_STATUS_REMOVED:
+            if key in sfp_insert_events:
+                del sfp_insert_events[key]
+
+    for key, itime in list(sfp_insert_events.items()):
+        if time.time() - itime >= MGMT_INIT_TIME_DELAY_SECS:
+            port_dict[key] = SFP_STATUS_INSERTED
+            del sfp_insert_events[key]
 
 def _wrapper_get_transceiver_change_event(timeout):
     if platform_chassis is not None:
@@ -205,8 +225,7 @@ def _wrapper_get_sfp_type(physical_port):
 
 # Remove unnecessary unit from the raw data
 
-
-def beautify_dom_info_dict(dom_info_dict):
+def beautify_dom_info_dict(dom_info_dict, physical_port):
     dom_info_dict['temperature'] = strip_unit_and_beautify(dom_info_dict['temperature'], TEMP_UNIT)
     dom_info_dict['voltage'] = strip_unit_and_beautify(dom_info_dict['voltage'], VOLT_UNIT)
     dom_info_dict['rx1power'] = strip_unit_and_beautify(dom_info_dict['rx1power'], POWER_UNIT)
@@ -221,6 +240,19 @@ def beautify_dom_info_dict(dom_info_dict):
     dom_info_dict['tx2power'] = strip_unit_and_beautify(dom_info_dict['tx2power'], POWER_UNIT)
     dom_info_dict['tx3power'] = strip_unit_and_beautify(dom_info_dict['tx3power'], POWER_UNIT)
     dom_info_dict['tx4power'] = strip_unit_and_beautify(dom_info_dict['tx4power'], POWER_UNIT)
+    if _wrapper_get_sfp_type(physical_port) == 'QSFP_DD':
+        dom_info_dict['rx5power'] = strip_unit_and_beautify(dom_info_dict['rx5power'], POWER_UNIT)
+        dom_info_dict['rx6power'] = strip_unit_and_beautify(dom_info_dict['rx6power'], POWER_UNIT)
+        dom_info_dict['rx7power'] = strip_unit_and_beautify(dom_info_dict['rx7power'], POWER_UNIT)
+        dom_info_dict['rx8power'] = strip_unit_and_beautify(dom_info_dict['rx8power'], POWER_UNIT)
+        dom_info_dict['tx5bias'] = strip_unit_and_beautify(dom_info_dict['tx5bias'], BIAS_UNIT)
+        dom_info_dict['tx6bias'] = strip_unit_and_beautify(dom_info_dict['tx6bias'], BIAS_UNIT)
+        dom_info_dict['tx7bias'] = strip_unit_and_beautify(dom_info_dict['tx7bias'], BIAS_UNIT)
+        dom_info_dict['tx8bias'] = strip_unit_and_beautify(dom_info_dict['tx8bias'], BIAS_UNIT)
+        dom_info_dict['tx5power'] = strip_unit_and_beautify(dom_info_dict['tx5power'], POWER_UNIT)
+        dom_info_dict['tx6power'] = strip_unit_and_beautify(dom_info_dict['tx6power'], POWER_UNIT)
+        dom_info_dict['tx7power'] = strip_unit_and_beautify(dom_info_dict['tx7power'], POWER_UNIT)
+        dom_info_dict['tx8power'] = strip_unit_and_beautify(dom_info_dict['tx8power'], POWER_UNIT)
 
 
 def beautify_dom_threshold_info_dict(dom_info_dict):
@@ -250,7 +282,6 @@ def beautify_dom_threshold_info_dict(dom_info_dict):
     dom_info_dict['txbiaslowwarning'] = strip_unit_and_beautify(dom_info_dict['txbiaslowwarning'], BIAS_UNIT)
 
 # Update port sfp info in db
-
 
 def post_port_sfp_info_to_db(logical_port_name, table, transceiver_dict,
                              stop_event=threading.Event()):
@@ -399,7 +430,7 @@ def post_port_dom_info_to_db(logical_port_name, table, stop_event=threading.Even
         try:
             dom_info_dict = _wrapper_get_transceiver_dom_info(physical_port)
             if dom_info_dict is not None:
-                beautify_dom_info_dict(dom_info_dict)
+                beautify_dom_info_dict(dom_info_dict, physical_port)
                 if _wrapper_get_sfp_type(physical_port) == 'QSFP_DD':
                     fvs = swsscommon.FieldValuePairs(
                         [('temperature', dom_info_dict['temperature']),
@@ -545,8 +576,9 @@ def recover_missing_sfp_table_entries(sfp_util, int_tbl, status_tbl, stop_event)
 
 
 def check_port_in_range(range_str, physical_port):
-    range_separator = '-'
-    range_list = range_str.split(range_separator)
+    RANGE_SEPARATOR = '-'
+
+    range_list = range_str.split(RANGE_SEPARATOR)
     start_num = int(range_list[0].strip())
     end_num = int(range_list[1].strip())
     if start_num <= physical_port <= end_num:
@@ -555,8 +587,11 @@ def check_port_in_range(range_str, physical_port):
 
 
 def get_media_settings_value(physical_port, key):
-    range_separator = '-'
-    comma_separator = ','
+    GLOBAL_MEDIA_SETTINGS_KEY = 'GLOBAL_MEDIA_SETTINGS'
+    PORT_MEDIA_SETTINGS_KEY = 'PORT_MEDIA_SETTINGS'
+    DEFAULT_KEY = 'Default'
+    RANGE_SEPARATOR = '-'
+    COMMA_SEPARATOR = ','
     media_dict = {}
     default_dict = {}
 
@@ -566,22 +601,22 @@ def get_media_settings_value(physical_port, key):
     # 1,2,3,4,5
     # 1-4,9-12
 
-    if "GLOBAL_MEDIA_SETTINGS" in g_dict:
-        for keys in g_dict["GLOBAL_MEDIA_SETTINGS"]:
-            if comma_separator in keys:
-                port_list = keys.split(comma_separator)
+    if GLOBAL_MEDIA_SETTINGS_KEY in g_dict:
+        for keys in g_dict[GLOBAL_MEDIA_SETTINGS_KEY]:
+            if COMMA_SEPARATOR in keys:
+                port_list = keys.split(COMMA_SEPARATOR)
                 for port in port_list:
-                    if range_separator in port:
+                    if RANGE_SEPARATOR in port:
                         if check_port_in_range(port, physical_port):
-                            media_dict = g_dict["GLOBAL_MEDIA_SETTINGS"][keys]
+                            media_dict = g_dict[GLOBAL_MEDIA_SETTINGS_KEY][keys]
                             break
                     elif str(physical_port) == port:
-                        media_dict = g_dict["GLOBAL_MEDIA_SETTINGS"][keys]
+                        media_dict = g_dict[GLOBAL_MEDIA_SETTINGS_KEY][keys]
                         break
 
-            elif range_separator in keys:
+            elif RANGE_SEPARATOR in keys:
                 if check_port_in_range(keys, physical_port):
-                    media_dict = g_dict["GLOBAL_MEDIA_SETTINGS"][keys]
+                    media_dict = g_dict[GLOBAL_MEDIA_SETTINGS_KEY][keys]
 
             # If there is a match in the global profile for a media type,
             # fetch those values
@@ -589,35 +624,37 @@ def get_media_settings_value(physical_port, key):
                 return media_dict[key[0]]
             elif key[1] in media_dict:
                 return media_dict[key[1]]
-            elif "Default" in media_dict:
-                default_dict = media_dict['Default']
+            elif DEFAULT_KEY in media_dict:
+                default_dict = media_dict[DEFAULT_KEY]
 
     media_dict = {}
 
-    if "PORT_MEDIA_SETTINGS" in g_dict:
-        for keys in g_dict["PORT_MEDIA_SETTINGS"]:
+    if PORT_MEDIA_SETTINGS_KEY in g_dict:
+        for keys in g_dict[PORT_MEDIA_SETTINGS_KEY]:
             if int(keys) == physical_port:
-                media_dict = g_dict["PORT_MEDIA_SETTINGS"][keys]
+                media_dict = g_dict[PORT_MEDIA_SETTINGS_KEY][keys]
                 break
+
         if len(media_dict) == 0:
-            if default_dict != 0:
+            if len(default_dict) != 0:
                 return default_dict
             else:
                 helper_logger.log_error("Error: No values for physical port '{}'".format(physical_port))
             return {}
+
         if key[0] in media_dict:
             return media_dict[key[0]]
         elif key[1] in media_dict:
             return media_dict[key[1]]
-        elif "Default" in media_dict:
-            return media_dict['Default']
+        elif DEFAULT_KEY in media_dict:
+            return media_dict[DEFAULT_KEY]
         elif len(default_dict) != 0:
             return default_dict
-        else:
-            return {}
     else:
-        if default_dict != 0:
+        if len(default_dict) != 0:
             return default_dict
+
+    return {}
 
 
 def get_media_settings_key(physical_port, transceiver_dict):
@@ -632,46 +669,61 @@ def get_media_settings_key(physical_port, transceiver_dict):
         media_len = transceiver_dict[physical_port]['cable_length']
 
     media_compliance_dict_str = transceiver_dict[physical_port]['specification_compliance']
-    media_compliance_dict = ast.literal_eval(media_compliance_dict_str)
     media_compliance_code = ''
     media_type = ''
+    media_key = ''
+    media_compliance_dict = {}
 
-    if sup_compliance_str in media_compliance_dict:
-        media_compliance_code = media_compliance_dict[sup_compliance_str]
+    try:
+        if _wrapper_get_sfp_type(physical_port) == 'QSFP_DD':
+            media_compliance_code = media_compliance_dict_str
+        else:
+            media_compliance_dict = ast.literal_eval(media_compliance_dict_str)
+            if sup_compliance_str in media_compliance_dict:
+                media_compliance_code = media_compliance_dict[sup_compliance_str]
+    except ValueError as e:
+        helper_logger.log_error("Invalid value for port {} 'specification_compliance': {}".format(physical_port, media_compliance_dict_str))
 
     media_type = transceiver_dict[physical_port]['type_abbrv_name']
-
-    media_key = ''
 
     if len(media_type) != 0:
         media_key += media_type
     if len(media_compliance_code) != 0:
         media_key += '-' + media_compliance_code
-        if len(media_len) != 0:
-            media_key += '-' + media_len + 'M'
+        if _wrapper_get_sfp_type(physical_port) == 'QSFP_DD':
+            if media_compliance_code == "passive_copper_media_interface":
+                if len(media_len) != 0:
+                    media_key += '-' + media_len + 'M'
+        else:
+            if len(media_len) != 0:
+                media_key += '-' + media_len + 'M'
+    else:
+        media_key += '-' + '*'
 
     return [vendor_key, media_key]
 
 
 def get_media_val_str_from_dict(media_dict):
+    LANE_STR = 'lane'
+    LANE_SEPARATOR = ','
+
     media_str = ''
-    lane_str = 'lane'
-    lane_separator = ','
     tmp_dict = {}
 
     for keys in media_dict:
-        lane_num = int(keys.strip()[len(lane_str):])
+        lane_num = int(keys.strip()[len(LANE_STR):])
         tmp_dict[lane_num] = media_dict[keys]
 
     for key in range(0, len(tmp_dict)):
         media_str += tmp_dict[key]
         if key != list(tmp_dict.keys())[-1]:
-            media_str += lane_separator
+            media_str += LANE_SEPARATOR
     return media_str
 
 
 def get_media_val_str(num_logical_ports, lane_dict, logical_idx):
-    lane_str = "lane"
+    LANE_STR = 'lane'
+
     logical_media_dict = {}
     num_lanes_on_port = len(lane_dict)
 
@@ -685,8 +737,8 @@ def get_media_val_str(num_logical_ports, lane_dict, logical_idx):
 
         for lane_idx in range(start_lane, start_lane +
                               num_lanes_per_logical_port):
-            lane_idx_str = lane_str + str(lane_idx)
-            logical_lane_idx_str = lane_str + str(lane_idx - start_lane)
+            lane_idx_str = LANE_STR + str(lane_idx)
+            logical_lane_idx_str = LANE_STR + str(lane_idx - start_lane)
             logical_media_dict[logical_lane_idx_str] = lane_dict[lane_idx_str]
 
         media_val_str = get_media_val_str_from_dict(logical_media_dict)
@@ -728,8 +780,8 @@ def notify_media_setting(logical_port_name, transceiver_dict,
         key = get_media_settings_key(physical_port, transceiver_dict)
         media_dict = get_media_settings_value(physical_port, key)
 
-        if(len(media_dict) == 0):
-            helper_logger.log_error("Error in obtaining media setting")
+        if len(media_dict) == 0:
+            helper_logger.log_error("Error in obtaining media setting for {}".format(logical_port_name))
             return
 
         fvs = swsscommon.FieldValuePairs(len(media_dict))
@@ -884,6 +936,7 @@ class SfpStateUpdateTask(object):
     def __init__(self):
         self.task_process = None
         self.task_stopping_event = multiprocessing.Event()
+        self.sfp_insert_events = {}
 
     def _mapping_event_from_change_event(self, status, port_dict):
         """
@@ -1001,7 +1054,13 @@ class SfpStateUpdateTask(object):
         while not stopping_event.is_set():
             next_state = state
             time_start = time.time()
+            # Ensure not to block for any event if sfp insert event is pending
+            if self.sfp_insert_events:
+                timeout = SFP_INSERT_EVENT_POLL_PERIOD_MSECS
             status, port_dict = _wrapper_get_transceiver_change_event(timeout)
+            if status:
+                # Soak SFP insert events across various ports (updates port_dict)
+                _wrapper_soak_sfp_insert_event(self.sfp_insert_events, port_dict)
             if not port_dict:
                 continue
             helper_logger.log_debug("Got event {} {} in state {}".format(status, port_dict, state))
@@ -1318,6 +1377,8 @@ class DaemonXcvrd(daemon_base.DaemonBase):
 
         if self.y_cable_presence[0] is True:
             y_cable_helper.delete_ports_status_for_y_cable()
+
+        del globals()['platform_chassis']
 
     # Run daemon
 
